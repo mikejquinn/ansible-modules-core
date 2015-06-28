@@ -32,7 +32,7 @@ options:
   zone:
     description:
       - The DNS zone to modify
-    required: true
+    required: false
     default: null
     aliases: []
   zone_id:
