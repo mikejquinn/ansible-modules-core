@@ -31,8 +31,14 @@ options:
     choices: [ 'get', 'create', 'delete' ]
   zone:
     description:
-      - The DNS zone to modify
-    required: true
+      - The name of the DNS zone to modify
+    required: false
+    default: null
+    aliases: []
+  zone:
+    description:
+      - The hosted zone ID of the zone to modify. Required if you have multiple private zones and want to modify one of them.
+    required: false
     default: null
     aliases: []
   record:
@@ -195,11 +201,34 @@ def commit(changes, retry_interval):
                 raise e
             time.sleep(float(retry_interval))
 
+def get_zone_by_id(conn, zone_id):
+    response = conn.get_all_hosted_zones()
+    for zone in response['ListHostedZonesResponse']['HostedZones']:
+        if zone_id == zone['Id'].replace('/hostedzone/', ''):
+            return zone
+    return None
+
+def get_zone_by_name(conn, module, zone_name, want_private):
+    response = conn.get_all_hosted_zones()
+    found_zone = None
+    for zone in response['ListHostedZonesResponse']['HostedZones']:
+        if zone['Name'] == zone_name:
+            private_zone = module.boolean(zone['Config'].get('PrivateZone', False))
+            if want_private and private_zone:
+                if found_zone is not None:
+                    module.fail_json(msg = "multiple private zones found - provide the 'zone_id' param")
+                found_zone = zone
+            elif not want_private and not private_zone:
+                # There can only be one public zone, so just return it.
+                return zone
+    return found_zone
+
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
             command              = dict(choices=['get', 'create', 'delete'], required=True),
-            zone                 = dict(required=True),
+            zone                 = dict(required=False),
+            zone_id              = dict(required=False),
             record               = dict(required=True),
             ttl                  = dict(required=False, type='int', default=3600),
             type                 = dict(choices=['A', 'CNAME', 'MX', 'AAAA', 'TXT', 'PTR', 'SRV', 'SPF', 'NS'], required=True),
@@ -214,7 +243,8 @@ def main():
     module = AnsibleModule(argument_spec=argument_spec)
 
     command_in              = module.params.get('command')
-    zone_in                 = module.params.get('zone').lower()
+    zone_in                 = module.params.get('zone')
+    zone_id_in              = module.params.get('zone_id')
     ttl_in                  = module.params.get('ttl')
     record_in               = module.params.get('record').lower()
     type_in                 = module.params.get('type')
@@ -234,8 +264,16 @@ def main():
     elif type(value_in)  is list:
         value_list = sorted(value_in)
 
-    if zone_in[-1:] != '.':
-        zone_in += "."
+    if (zone_in is None and zone_id_in is None) or (zone_in and zone_id_in):
+        module.fail_json(msg = "exactly one of 'zone' or 'zone_id' parameters required")
+
+    if zone_id_in and private_zone_in:
+        module.fail_json(msg = "only one of 'zone_id' or 'private_zone' parameters may be provided")
+
+    if zone_in:
+        zone_in = zone_in.lower()
+        if zone_in[-1:] != '.':
+            zone_in += "."
 
     if record_in[-1:] != '.':
         record_in += "."
@@ -249,31 +287,30 @@ def main():
           elif not alias_hosted_zone_id_in:
               module.fail_json(msg = "parameter 'alias_hosted_zone_id' required for alias create/delete")
 
-    # connect to the route53 endpoint 
+    # connect to the route53 endpoint
     try:
         conn = boto.route53.connection.Route53Connection(aws_access_key, aws_secret_key)
     except boto.exception.BotoServerError, e:
         module.fail_json(msg = e.error_message)
 
-    # Get all the existing hosted zones and save their ID's
-    zones = {}
-    results = conn.get_all_hosted_zones()
-    for r53zone in results['ListHostedZonesResponse']['HostedZones']:
-        # only save this zone id if the private status of the zone matches
-        # the private_zone_in boolean specified in the params
-        if module.boolean(r53zone['Config'].get('PrivateZone', False)) == private_zone_in:
-            zone_id = r53zone['Id'].replace('/hostedzone/', '')
-            zones[r53zone['Name']] = zone_id
+    # Find the requested hosted zone
+    zone = None
+    if zone_id_in:
+        zone = get_zone_by_id(conn, zone_id_in)
+    else:
+        zone = get_zone_by_name(conn, module, zone_in, private_zone_in)
 
     # Verify that the requested zone is already defined in Route53
-    if not zone_in in zones:
-        errmsg = "Zone %s does not exist in Route53" % zone_in
-        module.fail_json(msg = errmsg)
+    if zone is None:
+        module.fail_json(msg = "Route53 zone not found")
+
+    zone_id = zone['Id'].replace('/hostedzone/', '')
+    zone_name = zone['Name']
 
     record = {}
-    
+
     found_record = False
-    sets = conn.get_all_rrsets(zones[zone_in])
+    sets = conn.get_all_rrsets(zone_id)
     for rset in sets:
         # Due to a bug in either AWS or Boto, "special" characters are returned as octals, preventing round
         # tripping of things like * and @.
@@ -282,7 +319,8 @@ def main():
 
         if rset.type == type_in and decoded_name.lower() == record_in.lower():
             found_record = True
-            record['zone'] = zone_in
+            record['zone'] = zone_name
+            record['zone_id'] = zone_id
             record['type'] = rset.type
             record['record'] = decoded_name
             record['ttl'] = rset.ttl
@@ -306,7 +344,7 @@ def main():
     if command_in == 'delete' and not found_record:
         module.exit_json(changed=False)
 
-    changes = ResourceRecordSets(conn, zones[zone_in])
+    changes = ResourceRecordSets(conn, zone_id)
 
     if command_in == 'create' and found_record:
         if not module.params['overwrite']:
