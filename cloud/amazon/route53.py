@@ -34,13 +34,12 @@ options:
       - The DNS zone to modify
     required: false
     default: null
-    version_added: 2.0
   zone_id:
     description:
       - The hosted zone ID of the zone to modify. Required if you have multiple private zones and want to modify one of them.
     required: false
     default: null
-    aliases: []
+    version_added: 2.0
   record:
     description:
       - The full DNS record to create or delete
